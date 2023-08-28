@@ -37,7 +37,7 @@ import (
 // can handle the specific frisbee requirements. This is not meant to be used on its own, and instead is
 // meant to be used by frisbee client and server implementations
 type Sync struct {
-	sync.Mutex
+	connmu sync.Mutex
 	conn   net.Conn
 	closed *atomic.Bool
 	logger *zerolog.Logger
@@ -151,15 +151,15 @@ func (c *Sync) WritePacket(p *packet.Packet) error {
 	binary.BigEndian.PutUint16(encodedMetadata[metadata.OperationOffset:metadata.OperationOffset+metadata.OperationSize], p.Metadata.Operation)
 	binary.BigEndian.PutUint32(encodedMetadata[metadata.ContentLengthOffset:metadata.ContentLengthOffset+metadata.ContentLengthSize], p.Metadata.ContentLength)
 
-	c.Lock()
 	if c.closed.Load() {
-		c.Unlock()
 		return ConnectionClosed
 	}
 
+	c.connmu.Lock()
 	_, err := c.conn.Write(encodedMetadata[:])
+	c.connmu.Unlock()
+
 	if err != nil {
-		c.Unlock()
 		if c.closed.Load() {
 			c.Logger().Debug().Err(ConnectionClosed).Uint16("Packet ID", p.Metadata.Id).Msg("error while writing encoded metadata")
 			return ConnectionClosed
@@ -168,9 +168,12 @@ func (c *Sync) WritePacket(p *packet.Packet) error {
 		return c.closeWithError(err)
 	}
 	if p.Metadata.ContentLength != 0 {
+
+		c.connmu.Lock()
 		_, err = c.conn.Write((*p.Content)[:p.Metadata.ContentLength])
+		c.connmu.Unlock()
+
 		if err != nil {
-			c.Unlock()
 			if c.closed.Load() {
 				c.Logger().Debug().Err(ConnectionClosed).Uint16("Packet ID", p.Metadata.Id).Msg("error while writing encoded metadata")
 				return ConnectionClosed
@@ -180,7 +183,6 @@ func (c *Sync) WritePacket(p *packet.Packet) error {
 		}
 	}
 
-	c.Unlock()
 	return nil
 }
 

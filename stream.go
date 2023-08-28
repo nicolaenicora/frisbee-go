@@ -20,7 +20,6 @@ import (
 	"github.com/loopholelabs/common/pkg/queue"
 	"github.com/loopholelabs/frisbee-go/pkg/packet"
 	"go.uber.org/atomic"
-	"sync"
 )
 
 // DefaultStreamBufferSize is the default size of the stream buffer.
@@ -29,12 +28,11 @@ const DefaultStreamBufferSize = 1 << 12
 type NewStreamHandler func(*Stream)
 
 type Stream struct {
-	id      uint16
-	conn    *Async
-	closed  *atomic.Bool
-	queue   *queue.Circular[packet.Packet, *packet.Packet]
-	staleMu sync.Mutex
-	stale   []*packet.Packet
+	id     uint16
+	conn   *Async
+	closed *atomic.Bool
+	queue  *queue.Circular[packet.Packet, *packet.Packet]
+	stale  *Packets
 }
 
 func newStream(id uint16, conn *Async) *Stream {
@@ -43,6 +41,7 @@ func newStream(id uint16, conn *Async) *Stream {
 		conn:   conn,
 		closed: atomic.NewBool(false),
 		queue:  queue.NewCircular[packet.Packet, *packet.Packet](DefaultStreamBufferSize),
+		stale:  NewPackets(),
 	}
 }
 
@@ -50,28 +49,20 @@ func newStream(id uint16, conn *Async) *Stream {
 // In the event that the connection is closed, ReadPacket will return an error.
 func (s *Stream) ReadPacket() (*packet.Packet, error) {
 	if s.closed.Load() {
-		s.staleMu.Lock()
-		if len(s.stale) > 0 {
-			var p *packet.Packet
-			p, s.stale = s.stale[0], s.stale[1:]
-			s.staleMu.Unlock()
+		p := s.stale.Poll()
+		if p != nil {
 			return p, nil
 		}
-		s.staleMu.Unlock()
 		return nil, StreamClosed
 	}
 
 	readPacket, err := s.queue.Pop()
 	if err != nil {
 		if s.closed.Load() {
-			s.staleMu.Lock()
-			if len(s.stale) > 0 {
-				var p *packet.Packet
-				p, s.stale = s.stale[0], s.stale[1:]
-				s.staleMu.Unlock()
+			p := s.stale.Poll()
+			if p != nil {
 				return p, nil
 			}
-			s.staleMu.Unlock()
 			return nil, StreamClosed
 		}
 		return nil, err
@@ -107,11 +98,10 @@ func (s *Stream) Conn() *Async {
 
 // Close will close the stream and prevent any further reads or writes.
 func (s *Stream) Close() error {
-	s.staleMu.Lock()
 	if s.closed.CompareAndSwap(false, true) {
 		s.queue.Close()
-		s.stale = s.queue.Drain()
-		s.staleMu.Unlock()
+
+		s.stale.Set(s.queue.Drain())
 
 		p := packet.Get()
 		p.Metadata.Id = s.id
@@ -119,22 +109,16 @@ func (s *Stream) Close() error {
 		err := s.conn.writePacket(p)
 		packet.Put(p)
 
-		s.conn.streamsMu.Lock()
-		delete(s.conn.streams, s.id)
-		s.conn.streamsMu.Unlock()
-
+		s.conn.streams.Remove(s.id)
 		return err
 	}
-	s.staleMu.Unlock()
 	return StreamClosed
 }
 
 // close will close the stream and prevent any further reads or writes without sending a stream close packet.
 func (s *Stream) close() {
-	s.staleMu.Lock()
 	if s.closed.CompareAndSwap(false, true) {
 		s.queue.Close()
-		s.stale = s.queue.Drain()
+		s.stale.Set(s.queue.Drain())
 	}
-	s.staleMu.Unlock()
 }
